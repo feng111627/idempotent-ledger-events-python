@@ -35,10 +35,23 @@ CREATE TABLE IF NOT EXISTS idempotency (
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
-    """打开一个连接（启用外键与 WAL）。"""
-    raise NotImplementedError
+    """打开连接：WAL 提高并发读写能力，开启外键，行映射为 Row。"""
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        str(path),
+        timeout=30.0,           # 锁等待超时，避免 BUSY 立刻报错
+        isolation_level=None,   # 手动事务，BEGIN IMMEDIATE 由仓储控制
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=FULL")
+    return conn
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """创建全部表与索引。"""
-    raise NotImplementedError
+    """幂等建表。"""
+    conn.executescript(SCHEMA_SQL)

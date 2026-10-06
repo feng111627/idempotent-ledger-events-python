@@ -89,20 +89,6 @@ class LedgerRepository:
             raise _wrap_db_error(exc) from None
         return [self._row_to_event(r) for r in rows]
 
-    def get_idempotent_record(self, key: str) -> tuple[str, str, str] | None:
-        """返回 (operation, request_hash, response_json)，不存在返回 None。"""
-        try:
-            row = self._conn.execute(
-                "SELECT operation, request_hash, response_json"
-                " FROM idempotency WHERE idempotency_key = ?",
-                (key,),
-            ).fetchone()
-        except sqlite3.Error as exc:
-            raise _wrap_db_error(exc) from None
-        if row is None:
-            return None
-        return row["operation"], row["request_hash"], row["response_json"]
-
     # ------------------------------------------------------------------ 写
     def insert_account(self, account_id: str, opening: Amount, now_iso: str,
                        response_json: str, request_hash: str,

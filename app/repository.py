@@ -40,6 +40,14 @@ def _wrap_db_error(exc: sqlite3.Error) -> StorageUnavailable:
     return StorageUnavailable("存储暂时不可用，请稍后重试")
 
 
+def _safe_rollback(conn: sqlite3.Connection) -> None:
+    """尽力回滚；回滚本身失败（如连接已关闭）不掩盖原异常。"""
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        log.warning("回滚失败（连接可能已失效），忽略以保留原始异常")
+
+
 class LedgerRepository:
     def __init__(self, db) -> None:
         # 接受 Database（按线程取连接）；也兼容直接传连接，便于单线程测试
@@ -118,16 +126,16 @@ class LedgerRepository:
                 conn, account_id, EventType.OPEN, opening, opening, None, now_iso)
             conn.execute("COMMIT")
         except (AccountAlreadyExists, IdempotencyConflict, IdempotentReplay):
-            conn.execute("ROLLBACK")
+            _safe_rollback(conn)
             raise
         except sqlite3.IntegrityError as exc:
-            conn.execute("ROLLBACK")
+            _safe_rollback(conn)
             if _is_accounts_pk_conflict(exc):
                 raise AccountAlreadyExists(
                     f"账户 {account_id!r} 已存在") from None
             raise _wrap_db_error(exc) from None
         except sqlite3.Error as exc:
-            conn.execute("ROLLBACK")
+            _safe_rollback(conn)
             raise _wrap_db_error(exc) from None
 
         log.info("开户成功 account=%s opening=%s seq=%s",
@@ -193,10 +201,10 @@ class LedgerRepository:
             conn.execute("COMMIT")
         except (AccountNotFound, InsufficientFunds,
                 IdempotencyConflict, IdempotentReplay):
-            conn.execute("ROLLBACK")
+            _safe_rollback(conn)
             raise
         except sqlite3.Error as exc:
-            conn.execute("ROLLBACK")
+            _safe_rollback(conn)
             raise _wrap_db_error(exc) from None
 
         log.info("转账成功 idem=%s %s->%s amount=%s seqs=%s,%s",

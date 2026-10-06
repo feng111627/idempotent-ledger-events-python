@@ -17,6 +17,7 @@ from app.domain import Account, Amount, EventType, LedgerEvent
 from app.errors import (
     AccountAlreadyExists,
     AccountNotFound,
+    IdempotentReplay,
     IdempotencyConflict,
     InsufficientFunds,
     StorageUnavailable,
@@ -103,6 +104,8 @@ class LedgerRepository:
         try:
             conn.execute("BEGIN IMMEDIATE")
             if idem_key is not None:
+                self._check_idempotency(
+                    conn, idem_key, "create_account", request_hash)
                 self._insert_idempotency(
                     conn, idem_key, "create_account", request_hash,
                     response_json, now_iso)
@@ -114,13 +117,12 @@ class LedgerRepository:
             seq = self._insert_event(
                 conn, account_id, EventType.OPEN, opening, opening, None, now_iso)
             conn.execute("COMMIT")
-        except (AccountAlreadyExists, IdempotencyConflict):
+        except (AccountAlreadyExists, IdempotencyConflict, IdempotentReplay):
             conn.execute("ROLLBACK")
             raise
         except sqlite3.IntegrityError as exc:
             conn.execute("ROLLBACK")
-            # accounts 主键冲突 -> 账户已存在；幂等键冲突单独区分
-            if _is_pk_conflict(exc, on="accounts"):
+            if _is_accounts_pk_conflict(exc):
                 raise AccountAlreadyExists(
                     f"账户 {account_id!r} 已存在") from None
             raise _wrap_db_error(exc) from None
@@ -143,6 +145,8 @@ class LedgerRepository:
         conn = self._conn
         try:
             conn.execute("BEGIN IMMEDIATE")
+            self._check_idempotency(
+                conn, transfer_id, "transfer", request_hash)
             self._insert_idempotency(
                 conn, transfer_id, "transfer", request_hash,
                 response_json, now_iso)
@@ -187,7 +191,8 @@ class LedgerRepository:
                 conn, to_id, EventType.TRANSFER_IN, amount,
                 Amount(dst_after), transfer_id, now_iso)
             conn.execute("COMMIT")
-        except (AccountNotFound, InsufficientFunds, IdempotencyConflict):
+        except (AccountNotFound, InsufficientFunds,
+                IdempotencyConflict, IdempotentReplay):
             conn.execute("ROLLBACK")
             raise
         except sqlite3.Error as exc:
@@ -198,6 +203,36 @@ class LedgerRepository:
                  transfer_id, from_id, to_id, amount, seq_out, seq_in)
 
     # -------------------------------------------------------------- helpers
+    @staticmethod
+    def _check_idempotency(conn: sqlite3.Connection, key: str, operation: str,
+                           request_hash: str) -> None:
+        """写事务内的权威幂等查重。
+
+        因为调用方持有 BEGIN IMMEDIATE 的写锁，这里的「查-插」与随后的
+        INSERT 对其他写者是原子的，所以并发同键请求不可能双双插入。
+        - 键不存在：放行；
+        - 同键同内容（含同操作）：抛 IdempotentReplay，回滚本次写入，
+          由服务层返回首次结果；
+        - 同键不同内容/跨操作：抛 IdempotencyConflict，绝不覆盖。
+        """
+        row = conn.execute(
+            "SELECT operation, request_hash, response_json"
+            " FROM idempotency WHERE idempotency_key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return
+        if row["operation"] == operation and row["request_hash"] == request_hash:
+            raise IdempotentReplay(
+                row["operation"], row["request_hash"], row["response_json"])
+        if row["operation"] != operation:
+            raise IdempotencyConflict(
+                f"幂等键 {key!r} 已用于操作 {row['operation']!r}，"
+                f"不能重用于 {operation!r}")
+        raise IdempotencyConflict(
+            f"幂等键 {key!r} 已提交过不同的请求内容，"
+            "拒绝静默覆盖；请使用新的幂等键发起新操作")
+
     @staticmethod
     def _insert_idempotency(conn: sqlite3.Connection, key: str, operation: str,
                             request_hash: str, response_json: str,
@@ -237,8 +272,12 @@ class LedgerRepository:
         )
 
 
-def _is_pk_conflict(exc: sqlite3.IntegrityError, on: str) -> bool:
-    """粗粒度判断是否为某表主键冲突（驱动错误信息不纳入对外响应）。"""
-    return on in ("accounts",) and exc.sqlite_errorname in (
-        "SQLITE_CONSTRAINT_PRIMARYKEY",
-    )
+def _is_accounts_pk_conflict(exc: sqlite3.IntegrityError) -> bool:
+    """判断是否为 accounts 表主键冲突。
+
+    只依据驱动的错误名/错误文本在仓储内部判定，原始报错不会进入
+    对外响应（对外统一为 AccountAlreadyExists）。
+    """
+    if getattr(exc, "sqlite_errorname", None) != "SQLITE_CONSTRAINT_PRIMARYKEY":
+        return False
+    return "accounts" in str(exc)

@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from app.domain import LedgerEvent
 from app.errors import (
     AccountNotFound,
+    IdempotentReplay,
     IdempotencyConflict,
     InvalidAmount,
     ReplayMismatch,
@@ -169,40 +170,34 @@ class LedgerService:
              preview: dict, write) -> dict:
         """统一幂等执行流程。
 
-        - 无幂等键：直接在单事务内写入并返回结果；
-        - 同键同内容：命中既有记录，返回首次响应（标注 replayed），
-          不再记账；
-        - 同键不同内容/不同操作：抛 IdempotencyConflict，绝不覆盖。
-
-        preview 是可由请求确定性推出的响应快照；它与业务变更在仓储的
-        同一个事务中落库，因此「业务变更 + 幂等记录」同生共死，
-        重复请求一定能取回与首次字节一致的结果。
+        权威查重发生在仓储的写事务（BEGIN IMMEDIATE）内部，因此对同键的
+        并发请求也是原子判定：
+        - 无幂等键：直接写入并返回结果；
+        - 首次提交：业务变更与幂等记录同一事务落库；
+        - 同键同内容（含并发输掉竞争）：仓储抛 IdempotentReplay，
+          返回首次落库的响应（标注 replayed），不重复记账；
+        - 同键不同内容/跨操作：抛 IdempotencyConflict，绝不覆盖。
         """
         preview_json = json.dumps(preview, ensure_ascii=False)
         if idem_key is None:
             return write(preview_json)
 
-        existing = self._repo.get_idempotent_record(idem_key)
-        if existing is not None:
-            old_op, old_hash, old_resp = existing
-            req_hash = canonical_request_hash(request)
-            if old_op != operation:
+        try:
+            write(preview_json)
+            log.info("首次提交 key=%s op=%s", idem_key, operation)
+            return preview
+        except IdempotentReplay as replay:
+            # 事务内查重命中：可能是顺序重复，也可能是并发重复
+            if replay.operation != operation or \
+                    replay.request_hash != canonical_request_hash(request):
+                # 理论上仓储已细分，这里做双保险
                 raise IdempotencyConflict(
-                    f"幂等键 {idem_key!r} 已用于操作 {old_op!r}，"
-                    f"不能重用于 {operation!r}")
-            if old_hash != req_hash:
-                raise IdempotencyConflict(
-                    f"幂等键 {idem_key!r} 已提交过不同的请求内容，"
-                    "拒绝静默覆盖；请使用新的幂等键发起新操作")
+                    f"幂等键 {idem_key!r} 与既有请求不一致，拒绝静默覆盖")
             log.info("幂等命中 key=%s op=%s，返回首次结果，不重复记账",
                      idem_key, operation)
-            payload = json.loads(old_resp)
+            payload = json.loads(replay.response_json)
             payload["replayed"] = True
             return payload
-
-        write(preview_json)
-        log.info("首次提交 key=%s op=%s", idem_key, operation)
-        return preview
 
 
 def event_to_dict(e: LedgerEvent) -> dict:

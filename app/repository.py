@@ -40,8 +40,14 @@ def _wrap_db_error(exc: sqlite3.Error) -> StorageUnavailable:
 
 
 class LedgerRepository:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._conn = conn
+    def __init__(self, db) -> None:
+        # 接受 Database（按线程取连接）；也兼容直接传连接，便于单线程测试
+        self._db = db
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        get_conn = getattr(self._db, "get_conn", None)
+        return get_conn() if callable(get_conn) else self._db
 
     # ------------------------------------------------------------------ 读
     def get_account(self, account_id: str) -> Account | None:

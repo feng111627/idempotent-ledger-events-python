@@ -16,18 +16,18 @@ case_log = logging.getLogger("ledger.test")
 
 
 @pytest.fixture
-def db_conn(tmp_path):
-    conn = db.connect(tmp_path / "test_ledger.db")
-    db.init_db(conn)
+def database(tmp_path):
+    dbase = db.Database(tmp_path / "test_ledger.db")
+    dbase.init()
     try:
-        yield conn
+        yield dbase
     finally:
-        conn.close()
+        dbase.close_current()
 
 
 @pytest.fixture
-def service(db_conn) -> LedgerService:
-    return LedgerService(LedgerRepository(db_conn))
+def service(database) -> LedgerService:
+    return LedgerService(LedgerRepository(database))
 
 
 @pytest.fixture

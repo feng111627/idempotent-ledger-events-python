@@ -45,3 +45,10 @@ class StorageUnavailable(LedgerError):
 
     code = "storage_unavailable"
     http_status = 503
+
+
+class ReplayMismatch(LedgerError):
+    """事件流重放余额与账户表不一致（账本已被破坏）。"""
+
+    code = "replay_mismatch"
+    http_status = 500

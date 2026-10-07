@@ -48,10 +48,31 @@ class SameAccountTransfer(LedgerError):
 
 
 class IdempotencyConflict(LedgerError):
-    """同一幂等键被用于不同的请求内容。"""
+    """同一作用域内同一幂等键被用于不同的请求内容。"""
 
     code = "IDEMPOTENCY_CONFLICT"
     http_status = 409
+
+
+class TransferNotFound(LedgerError):
+    """要冲正的原始转账不存在。"""
+
+    code = "TRANSFER_NOT_FOUND"
+    http_status = 404
+
+
+class TransferAlreadyReversed(LedgerError):
+    """该转账已被冲正过（与幂等重放不同：这是换了提交标识的再次冲正）。"""
+
+    code = "TRANSFER_ALREADY_REVERSED"
+    http_status = 409
+
+
+class InvalidRequest(LedgerError):
+    """请求体本身不合法（字段缺失/类型错误），与业务错误同一结构。"""
+
+    code = "INVALID_REQUEST"
+    http_status = 422
 
 
 class StorageError(LedgerError):

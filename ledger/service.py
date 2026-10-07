@@ -1,12 +1,15 @@
-"""账本业务逻辑：账户、转账、幂等、回放。
+"""账本业务逻辑：账户、转账、冲正、幂等、回放。
 
 一致性保证：
-- 每次转账的所有写入（余额更新 + 两条事件 + 幂等记录）发生在同一个
+- 每次转账/冲正的所有写入（余额更新 + 两条事件 + 幂等记录）发生在同一个
   SQLite 事务中，要么全部生效，要么全部回滚。
 - 并发写由 BEGIN IMMEDIATE 串行化，配合余额 CHECK 约束，不会透支、
   不会丢更新；借贷双方一正一负同额记账，总余额守恒。
-- 幂等：同一幂等键 + 相同请求内容 -> 返回首次保存的响应，不重复记账；
-  同一幂等键 + 不同请求内容 -> IdempotencyConflict。
+- 幂等：幂等记录按 (作用域, 键) 唯一。作用域 = 操作 + 业务对象，
+  同一标识用在不同操作或不同对象上各算各的；只有同作用域同键且
+  请求内容不同才算 IdempotencyConflict。
+- 冲正：只追加新事件（reversal_of 指向原始转账），原始事件永不改写；
+  reversals 表以 transfer_id 为主键，保证同一笔转账最多冲正一次。
 """
 
 from __future__ import annotations
@@ -21,9 +24,22 @@ from .errors import (
     IdempotencyConflict,
     InsufficientFunds,
     SameAccountTransfer,
+    TransferAlreadyReversed,
+    TransferNotFound,
 )
-from .models import Account, format_cents
+from .models import Account, format_cents, parse_amount_to_cents
 from .store import Store
+
+# 幂等作用域：转账以键本身为业务对象；开户/冲正以账户/原转账为对象
+_SCOPE_TRANSFER = "transfer"
+
+
+def _account_scope(account_id: str) -> str:
+    return f"account:{account_id}"
+
+
+def _reversal_scope(transfer_id: str) -> str:
+    return f"reversal:{transfer_id}"
 
 
 def _request_hash(payload: dict) -> str:
@@ -37,11 +53,45 @@ class LedgerService:
 
     # ---- 账户 ----
 
-    def create_account(self, account_id: str, initial_balance_cents: int = 0) -> Account:
+    def create_account(
+        self,
+        account_id: str,
+        initial_balance_cents: int = 0,
+        idempotency_key: str | None = None,
+    ) -> tuple[Account, bool]:
+        """开户。返回 (账户, 是否幂等重放)。
+
+        携带 idempotency_key 时按作用域 account:{account_id} 幂等：
+        同键同内容重试返回首次结果；同键不同内容 -> IdempotencyConflict；
+        同一键用在别的账户/别的操作上互不影响。
+        """
         if not account_id or not account_id.strip():
             raise ValueError("account_id must be non-empty")
         account_id = account_id.strip()
+
+        scope = _account_scope(account_id)
+        request_hash = _request_hash({
+            "op": "create_account",
+            "account_id": account_id,
+            "initial_balance_cents": initial_balance_cents,
+        })
+
         with self._store.transaction() as conn:
+            if idempotency_key is not None:
+                existing = Store.get_idempotency(conn, scope, idempotency_key)
+                if existing is not None:
+                    if existing["request_hash"] != request_hash:
+                        raise IdempotencyConflict(
+                            f"idempotency key {idempotency_key!r} was already used "
+                            "with a different request"
+                        )
+                    body = json.loads(existing["response_body"])
+                    return Account(
+                        body["account_id"],
+                        parse_amount_to_cents(body["balance"], allow_zero=True),
+                        body["created_at"],
+                    ), True
+
             if Store.get_account(conn, account_id) is not None:
                 raise AccountAlreadyExists(f"account {account_id!r} already exists")
             account = Store.insert_account(conn, account_id, initial_balance_cents)
@@ -56,7 +106,17 @@ class LedgerService:
                     balance_after_cents=initial_balance_cents,
                     idempotency_key=f"init:{account_id}",
                 )
-            return account
+            if idempotency_key is not None:
+                body = {
+                    "account_id": account.account_id,
+                    "balance": format_cents(account.balance_cents),
+                    "created_at": account.created_at,
+                }
+                Store.insert_idempotency(
+                    conn, scope, idempotency_key, request_hash, 201,
+                    json.dumps(body),
+                )
+            return account, False
 
     def get_account(self, account_id: str) -> Account:
         with self._store.read_conn() as conn:
@@ -87,7 +147,7 @@ class LedgerService:
 
         with self._store.transaction() as conn:
             # 1) 幂等检查
-            existing = Store.get_idempotency(conn, idempotency_key)
+            existing = Store.get_idempotency(conn, _SCOPE_TRANSFER, idempotency_key)
             if existing is not None:
                 if existing["request_hash"] != request_hash:
                     raise IdempotencyConflict(
@@ -137,7 +197,106 @@ class LedgerService:
                 "to_balance": format_cents(dst_after),
             }
             Store.insert_idempotency(
-                conn, idempotency_key, request_hash, 200, json.dumps(body)
+                conn, _SCOPE_TRANSFER, idempotency_key, request_hash, 200,
+                json.dumps(body)
+            )
+            return 200, body, False
+
+    # ---- 冲正（幂等，全额退款） ----
+
+    def reverse_transfer(
+        self,
+        transfer_id: str,
+        idempotency_key: str,
+    ) -> tuple[int, dict, bool]:
+        """对一笔已成功转账做全额冲正。返回 (HTTP 状态码, 响应体, 是否幂等重放)。
+
+        - 原始转账不存在 -> TransferNotFound (404)
+        - 同一转账已被冲正（换了提交标识再次冲正）-> TransferAlreadyReversed (409)
+        - 同键重试 -> 返回首次保存的结果，不重复记账
+        - 只追加冲正事件（reversal_of 指向原转账），原始事件不改写
+        """
+        scope = _reversal_scope(transfer_id)
+        request_hash = _request_hash({"op": "reversal", "transfer_id": transfer_id})
+
+        with self._store.transaction() as conn:
+            # 1) 幂等检查（同键重试直接重放首次结果）
+            existing = Store.get_idempotency(conn, scope, idempotency_key)
+            if existing is not None:
+                if existing["request_hash"] != request_hash:
+                    raise IdempotencyConflict(
+                        f"idempotency key {idempotency_key!r} was already used "
+                        "with a different request"
+                    )
+                return (
+                    existing["status_code"],
+                    json.loads(existing["response_body"]),
+                    True,
+                )
+
+            # 2) 找到原始转账的借贷事件对
+            originals = [
+                e for e in Store.list_events_for_transfer(conn, transfer_id)
+                if e.reversal_of is None
+            ]
+            debit = next((e for e in originals if e.kind == "debit"), None)
+            credit = next((e for e in originals if e.kind == "credit"), None)
+            if debit is None or credit is None:
+                raise TransferNotFound(
+                    f"transfer {transfer_id!r} not found or not reversible"
+                )
+
+            # 3) 同一笔转账最多冲正一次（reversals 表主键兜底）
+            if Store.get_reversal(conn, transfer_id) is not None:
+                raise TransferAlreadyReversed(
+                    f"transfer {transfer_id!r} has already been reversed"
+                )
+
+            # 4) 全额退款：钱退回原付款方
+            from_account = debit.account_id   # 原付款方
+            to_account = credit.account_id    # 原收款方
+            amount_cents = credit.delta_cents
+            payer = Store.get_account(conn, from_account)
+            payee = Store.get_account(conn, to_account)
+            if payer is None:
+                raise AccountNotFound(f"account {from_account!r} not found")
+            if payee is None:
+                raise AccountNotFound(f"account {to_account!r} not found")
+            if payee.balance_cents < amount_cents:
+                raise InsufficientFunds(
+                    f"account {to_account!r} balance "
+                    f"{format_cents(payee.balance_cents)} cannot cover reversal "
+                    f"of {format_cents(amount_cents)}"
+                )
+
+            reversal_id = uuid.uuid4().hex
+            payee_after = payee.balance_cents - amount_cents
+            payer_after = payer.balance_cents + amount_cents
+            Store.update_balance(conn, to_account, payee_after)
+            Store.update_balance(conn, from_account, payer_after)
+            Store.insert_event(
+                conn, reversal_id, to_account, "debit",
+                -amount_cents, payee_after, idempotency_key,
+                reversal_of=transfer_id,
+            )
+            Store.insert_event(
+                conn, reversal_id, from_account, "credit",
+                amount_cents, payer_after, idempotency_key,
+                reversal_of=transfer_id,
+            )
+            Store.insert_reversal(conn, transfer_id, reversal_id, idempotency_key)
+
+            body = {
+                "reversal_id": reversal_id,
+                "transfer_id": transfer_id,
+                "from_account": from_account,
+                "to_account": to_account,
+                "amount": format_cents(amount_cents),
+                "from_balance": format_cents(payer_after),
+                "to_balance": format_cents(payee_after),
+            }
+            Store.insert_idempotency(
+                conn, scope, idempotency_key, request_hash, 200, json.dumps(body)
             )
             return 200, body, False
 
@@ -193,9 +352,28 @@ class LedgerService:
                 "match": match,
             })
 
+        # 冲正一览：从事件流中还原“原转账 -> 冲正”的对应关系
+        reversals: dict[str, dict] = {}
+        for ev in events:
+            if ev.reversal_of is None:
+                continue
+            entry = reversals.setdefault(ev.reversal_of, {
+                "transfer_id": ev.reversal_of,
+                "reversal_id": ev.transfer_id,
+                "amount_cents": 0,
+            })
+            if ev.kind == "credit":
+                entry["amount_cents"] += ev.delta_cents
+        report_reversals = []
+        for tid in sorted(reversals):
+            r = reversals[tid]
+            amount_cents = r.pop("amount_cents")
+            report_reversals.append({**r, "amount": format_cents(amount_cents)})
+
         return {
             "consistent": consistent,
             "event_count": len(events),
             "accounts": report_accounts,
+            "reversals": report_reversals,
             "chain_errors": chain_errors,
         }

@@ -27,11 +27,15 @@ CREATE TABLE IF NOT EXISTS accounts (
 );
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
-    key          TEXT PRIMARY KEY,
+    -- 作用域 + 键 共同唯一：同一标识用在不同操作/不同业务对象上各算各的，
+    -- 只有同作用域同键但请求内容不同才算冲突。
+    scope        TEXT NOT NULL,
+    key          TEXT NOT NULL,
     request_hash TEXT NOT NULL,
     status_code  INTEGER NOT NULL,
     response_body TEXT NOT NULL,
-    created_at   TEXT NOT NULL
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (scope, key)
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -42,10 +46,20 @@ CREATE TABLE IF NOT EXISTS events (
     delta_cents         INTEGER NOT NULL,
     balance_after_cents INTEGER NOT NULL,
     idempotency_key     TEXT NOT NULL,
+    reversal_of         TEXT,  -- 冲正事件指向被冲正的原始 transfer_id
     created_at          TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_account ON events(account_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_events_transfer ON events(transfer_id);
+
+-- 冲正登记：transfer_id 主键保证同一笔转账最多被冲正一次（事务内原子生效）
+CREATE TABLE IF NOT EXISTS reversals (
+    transfer_id     TEXT PRIMARY KEY,
+    reversal_id     TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
 
 
@@ -172,13 +186,28 @@ class Store:
         delta_cents: int,
         balance_after_cents: int,
         idempotency_key: str,
+        reversal_of: str | None = None,
     ) -> None:
         conn.execute(
             "INSERT INTO events (transfer_id, account_id, kind, delta_cents,"
-            " balance_after_cents, idempotency_key, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " balance_after_cents, idempotency_key, reversal_of, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (transfer_id, account_id, kind, delta_cents, balance_after_cents,
-             idempotency_key, _now()),
+             idempotency_key, reversal_of, _now()),
+        )
+
+    @staticmethod
+    def _row_to_event(r: sqlite3.Row) -> LedgerEvent:
+        return LedgerEvent(
+            event_id=r["event_id"],
+            transfer_id=r["transfer_id"],
+            account_id=r["account_id"],
+            kind=r["kind"],
+            delta_cents=r["delta_cents"],
+            balance_after_cents=r["balance_after_cents"],
+            idempotency_key=r["idempotency_key"],
+            created_at=r["created_at"],
+            reversal_of=r["reversal_of"],
         )
 
     @staticmethod
@@ -192,40 +221,64 @@ class Store:
                 "SELECT * FROM events WHERE account_id = ? ORDER BY event_id",
                 (account_id,),
             ).fetchall()
-        return [
-            LedgerEvent(
-                event_id=r["event_id"],
-                transfer_id=r["transfer_id"],
-                account_id=r["account_id"],
-                kind=r["kind"],
-                delta_cents=r["delta_cents"],
-                balance_after_cents=r["balance_after_cents"],
-                idempotency_key=r["idempotency_key"],
-                created_at=r["created_at"],
-            )
-            for r in rows
-        ]
+        return [Store._row_to_event(r) for r in rows]
+
+    @staticmethod
+    def list_events_for_transfer(
+        conn: sqlite3.Connection, transfer_id: str
+    ) -> list[LedgerEvent]:
+        rows = conn.execute(
+            "SELECT * FROM events WHERE transfer_id = ? ORDER BY event_id",
+            (transfer_id,),
+        ).fetchall()
+        return [Store._row_to_event(r) for r in rows]
+
+    # ---- 冲正登记 ----
+
+    @staticmethod
+    def get_reversal(conn: sqlite3.Connection, transfer_id: str) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT transfer_id, reversal_id, idempotency_key, created_at"
+            " FROM reversals WHERE transfer_id = ?",
+            (transfer_id,),
+        ).fetchone()
+
+    @staticmethod
+    def insert_reversal(
+        conn: sqlite3.Connection,
+        transfer_id: str,
+        reversal_id: str,
+        idempotency_key: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO reversals (transfer_id, reversal_id, idempotency_key,"
+            " created_at) VALUES (?, ?, ?, ?)",
+            (transfer_id, reversal_id, idempotency_key, _now()),
+        )
 
     # ---- 幂等记录 ----
 
     @staticmethod
-    def get_idempotency(conn: sqlite3.Connection, key: str) -> sqlite3.Row | None:
+    def get_idempotency(
+        conn: sqlite3.Connection, scope: str, key: str
+    ) -> sqlite3.Row | None:
         return conn.execute(
-            "SELECT key, request_hash, status_code, response_body FROM idempotency_keys"
-            " WHERE key = ?",
-            (key,),
+            "SELECT scope, key, request_hash, status_code, response_body"
+            " FROM idempotency_keys WHERE scope = ? AND key = ?",
+            (scope, key),
         ).fetchone()
 
     @staticmethod
     def insert_idempotency(
         conn: sqlite3.Connection,
+        scope: str,
         key: str,
         request_hash: str,
         status_code: int,
         response_body: str,
     ) -> None:
         conn.execute(
-            "INSERT INTO idempotency_keys (key, request_hash, status_code, response_body,"
-            " created_at) VALUES (?, ?, ?, ?, ?)",
-            (key, request_hash, status_code, response_body, _now()),
+            "INSERT INTO idempotency_keys (scope, key, request_hash, status_code,"
+            " response_body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (scope, key, request_hash, status_code, response_body, _now()),
         )

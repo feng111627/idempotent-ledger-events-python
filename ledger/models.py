@@ -16,8 +16,15 @@ from .errors import InvalidAmount
 CENT = Decimal("0.01")
 
 
-def parse_amount_to_cents(raw: str | int | float | Decimal) -> int:
-    """把外部输入的金额解析为整数分；非法输入抛 InvalidAmount。"""
+def parse_amount_to_cents(
+    raw: str | int | float | Decimal,
+    *,
+    allow_zero: bool = False,
+) -> int:
+    """把外部输入的金额解析为整数分；非法输入抛 InvalidAmount。
+
+    allow_zero=True 时，0、0.0、0.00 等零金额写法都视为同一个合法值 0。
+    """
     if isinstance(raw, bool):
         raise InvalidAmount("amount must be a decimal number")
     try:
@@ -33,8 +40,11 @@ def parse_amount_to_cents(raw: str | int | float | Decimal) -> int:
         raise InvalidAmount("amount is out of representable range") from None
     if value != quantized:
         raise InvalidAmount("amount must have at most 2 decimal places")
-    if value <= 0:
-        raise InvalidAmount("amount must be positive")
+    if value < 0 or (value == 0 and not allow_zero):
+        raise InvalidAmount(
+            "amount must be non-negative" if allow_zero
+            else "amount must be positive"
+        )
     return int(value * 100)
 
 
@@ -60,3 +70,6 @@ class LedgerEvent:
     balance_after_cents: int
     idempotency_key: str
     created_at: str
+    # 若本事件属于一笔冲正，这里是被冲正的原始 transfer_id；否则为 None。
+    # 原始转账的事件永不被改写或删除，冲正只追加新事件。
+    reversal_of: str | None = None

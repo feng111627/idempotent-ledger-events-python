@@ -70,7 +70,9 @@ def test_failed_transfer_leaves_no_partial_state(service: LedgerService):
     assert service.get_account("b").balance_cents == 0
     with service._store.read_conn() as conn:
         events = Store.list_events(conn)
-        idem = Store.get_idempotency(conn, "fail-1")
+        idem = Store.get_idempotency(
+            conn, "fail-1", "transfer", "transfer_pair", "a->b"
+        )
     # 只有 a 的初始入金事件，失败转账不产生任何事件/幂等记录
     assert len(events) == 1
     assert idem is None
@@ -106,7 +108,9 @@ def test_mid_transaction_failure_rolls_back(service: LedgerService):
     assert service.get_account("b").balance_cents == 0
     with service._store.read_conn() as conn:
         assert len(Store.list_events(conn)) == 1  # 仅初始入金
-        assert Store.get_idempotency(conn, "atomic-1") is None
+        assert Store.get_idempotency(
+            conn, "atomic-1", "transfer", "transfer_pair", "a->b"
+        ) is None
     assert service.replay()["consistent"]
     logger.info("中途异常已回滚：余额与事件保持一致，异常被归一化为 StorageError")
 

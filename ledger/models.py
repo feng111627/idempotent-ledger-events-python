@@ -16,8 +16,12 @@ from .errors import InvalidAmount
 CENT = Decimal("0.01")
 
 
-def parse_amount_to_cents(raw: str | int | float | Decimal) -> int:
-    """把外部输入的金额解析为整数分；非法输入抛 InvalidAmount。"""
+def parse_amount_to_cents(raw: str | int | float | Decimal, *, allow_zero: bool = False) -> int:
+    """把外部输入的金额解析为整数分；非法输入抛 InvalidAmount。
+
+    默认只接受正数（转账金额）；``allow_zero=True`` 时 0、0.0、0.00
+    等常见零金额写法都会被归一化为 0 放行（开户初始金额）。
+    """
     if isinstance(raw, bool):
         raise InvalidAmount("amount must be a decimal number")
     try:
@@ -33,9 +37,16 @@ def parse_amount_to_cents(raw: str | int | float | Decimal) -> int:
         raise InvalidAmount("amount is out of representable range") from None
     if value != quantized:
         raise InvalidAmount("amount must have at most 2 decimal places")
-    if value <= 0:
+    if value < 0:
+        raise InvalidAmount("amount must not be negative")
+    if not allow_zero and value == 0:
         raise InvalidAmount("amount must be positive")
     return int(value * 100)
+
+
+def parse_initial_balance_to_cents(raw: str | int | float | Decimal) -> int:
+    """开户初始金额：允许 0、0.0、0.00 等零金额写法，统一归一化为 0。"""
+    return parse_amount_to_cents(raw, allow_zero=True)
 
 
 def format_cents(cents: int) -> str:
@@ -55,8 +66,30 @@ class LedgerEvent:
     event_id: int
     transfer_id: str
     account_id: str
-    kind: str  # "debit" | "credit"
-    delta_cents: int  # 带符号：debit 为负，credit 为正
+    kind: str  # "debit" | "credit" | "reversal_debit" | "reversal_credit"
+    delta_cents: int  # 带符号：debit 为负，credit 为正；冲正方向相反
     balance_after_cents: int
+    idempotency_key: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class TransferRecord:
+    """一次成功转账的汇总信息（从事件流聚合得到）。"""
+
+    transfer_id: str
+    from_account: str
+    to_account: str
+    amount_cents: int
+
+
+@dataclass(frozen=True)
+class Reversal:
+    """一次成功冲正的记录。"""
+
+    reversal_id: str
+    transfer_id: str
+    account_id: str  # 资金回退到的付款方
+    amount_cents: int
     idempotency_key: str
     created_at: str

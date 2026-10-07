@@ -44,15 +44,13 @@ def test_duplicate_submission_returns_same_result_without_double_booking(
 def test_same_key_different_content_conflicts(client: TestClient):
     client.post("/accounts", json={"account_id": "a", "initial_balance": "100.00"})
     client.post("/accounts", json={"account_id": "b"})
-    client.post("/accounts", json={"account_id": "c"})
     base = {"from_account": "a", "to_account": "b",
             "amount": "10.00", "idempotency_key": "pay-002"}
     assert client.post("/transfers", json=base).status_code == 200
 
+    # 同一操作、同一业务对象（同一付款方->收款方）但请求内容变了 = 真冲突
     variants = [
-        {**base, "amount": "20.00"},          # 金额不同
-        {**base, "to_account": "c"},          # 收款方不同
-        {**base, "from_account": "b", "to_account": "a"},  # 方向不同
+        {**base, "amount": "20.00"},  # 金额不同
     ]
     for v in variants:
         r = client.post("/transfers", json=v)
@@ -60,11 +58,52 @@ def test_same_key_different_content_conflicts(client: TestClient):
         body = r.json()
         assert body["error"]["code"] == "IDEMPOTENCY_CONFLICT"
         assert "different request" in body["error"]["message"]
-        logger.info("同键换内容被拒绝: %s", body["error"]["message"])
+        logger.info("同键同对象换内容被拒绝: %s", body["error"]["message"])
 
     # 冲突请求不得产生任何记账
     assert client.get("/accounts/b").json()["balance"] == "10.00"
     assert client.get("/replay").json()["consistent"]
+
+
+def test_same_key_on_different_objects_are_independent(client: TestClient):
+    """同一 key 用于不同操作或不同业务对象：各算各的，不覆盖也不误判冲突。"""
+    client.post("/accounts", json={"account_id": "a", "initial_balance": "100.00"})
+    client.post("/accounts", json={"account_id": "b"})
+    client.post("/accounts", json={"account_id": "c"})
+
+    # 同一个 key 先用于 a->b 转账
+    r1 = client.post("/transfers", json={
+        "from_account": "a", "to_account": "b",
+        "amount": "10.00", "idempotency_key": "shared-key",
+    })
+    assert r1.status_code == 200
+    # 再用于不同业务对象 a->c：不是冲突，独立记账
+    r2 = client.post("/transfers", json={
+        "from_account": "a", "to_account": "c",
+        "amount": "5.00", "idempotency_key": "shared-key",
+    })
+    assert r2.status_code == 200, r2.text
+    assert "x-idempotent-replay" not in r2.headers
+
+    # 各自重放都返回自己的首次结果
+    r1_again = client.post("/transfers", json={
+        "from_account": "a", "to_account": "b",
+        "amount": "10.00", "idempotency_key": "shared-key",
+    })
+    assert r1_again.headers["x-idempotent-replay"] == "true"
+    assert r1_again.json() == r1.json()
+    r2_again = client.post("/transfers", json={
+        "from_account": "a", "to_account": "c",
+        "amount": "5.00", "idempotency_key": "shared-key",
+    })
+    assert r2_again.headers["x-idempotent-replay"] == "true"
+    assert r2_again.json() == r2.json()
+
+    assert client.get("/accounts/a").json()["balance"] == "85.00"
+    assert client.get("/accounts/b").json()["balance"] == "10.00"
+    assert client.get("/accounts/c").json()["balance"] == "5.00"
+    assert client.get("/replay").json()["consistent"]
+    logger.info("同键作用于不同业务对象：互不覆盖、各自幂等")
 
 
 def test_concurrent_duplicate_submissions_record_once(service: LedgerService):

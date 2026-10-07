@@ -47,6 +47,27 @@ class SameAccountTransfer(LedgerError):
     http_status = 422
 
 
+class InvalidRequest(LedgerError):
+    """请求体本身不合法（字段缺失、类型不对等）。"""
+
+    code = "INVALID_REQUEST"
+    http_status = 422
+
+
+class TransferNotFound(LedgerError):
+    """冲正目标转账不存在。"""
+
+    code = "TRANSFER_NOT_FOUND"
+    http_status = 404
+
+
+class TransferAlreadyReversed(LedgerError):
+    """目标转账已经被冲正过（一笔转账最多冲正一次）。"""
+
+    code = "TRANSFER_ALREADY_REVERSED"
+    http_status = 409
+
+
 class IdempotencyConflict(LedgerError):
     """同一幂等键被用于不同的请求内容。"""
 

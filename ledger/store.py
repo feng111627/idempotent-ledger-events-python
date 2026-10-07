@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .errors import StorageError
-from .models import Account, LedgerEvent
+from .models import Account, LedgerEvent, Reversal, TransferRecord
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -26,26 +26,47 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at    TEXT NOT NULL
 );
 
+-- 幂等记录按“操作 + 业务对象”作用域存储：
+-- 同一个 key 用在不同操作或不同对象上各算各的，互不覆盖、互不冲突；
+-- 同一 (operation, scope_type, scope_id, key) 内，request_hash 不同才算真冲突。
 CREATE TABLE IF NOT EXISTS idempotency_keys (
-    key          TEXT PRIMARY KEY,
-    request_hash TEXT NOT NULL,
-    status_code  INTEGER NOT NULL,
+    operation     TEXT NOT NULL,
+    scope_type    TEXT NOT NULL,
+    scope_id      TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    request_hash  TEXT NOT NULL,
+    status_code   INTEGER NOT NULL,
     response_body TEXT NOT NULL,
-    created_at   TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (operation, scope_type, scope_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS events (
     event_id            INTEGER PRIMARY KEY AUTOINCREMENT,
     transfer_id         TEXT NOT NULL,
     account_id          TEXT NOT NULL,
-    kind                TEXT NOT NULL CHECK (kind IN ('debit', 'credit')),
+    kind                TEXT NOT NULL CHECK (kind IN
+                        ('debit', 'credit', 'reversal_debit', 'reversal_credit')),
     delta_cents         INTEGER NOT NULL,
     balance_after_cents INTEGER NOT NULL,
     idempotency_key     TEXT NOT NULL,
     created_at          TEXT NOT NULL
 );
 
+-- 每笔转账最多冲正一次：transfer_id 唯一约束与 BEGIN IMMEDIATE
+-- 共同保证并发冲正只有一次成功（冲正事件同样追加写入，原转账事件不改不删）。
+CREATE TABLE IF NOT EXISTS reversals (
+    reversal_id     TEXT PRIMARY KEY,
+    transfer_id     TEXT NOT NULL UNIQUE,
+    account_id      TEXT NOT NULL,
+    amount_cents    INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_account ON events(account_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_events_transfer ON events(transfer_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_reversals_transfer ON reversals(transfer_id);
 """
 
 
@@ -206,26 +227,129 @@ class Store:
             for r in rows
         ]
 
-    # ---- 幂等记录 ----
+    # ---- 幂等记录（按 操作 + 业务对象 作用域）----
 
     @staticmethod
-    def get_idempotency(conn: sqlite3.Connection, key: str) -> sqlite3.Row | None:
+    def get_idempotency(
+        conn: sqlite3.Connection,
+        key: str,
+        operation: str,
+        scope_type: str,
+        scope_id: str,
+    ) -> sqlite3.Row | None:
         return conn.execute(
             "SELECT key, request_hash, status_code, response_body FROM idempotency_keys"
-            " WHERE key = ?",
-            (key,),
+            " WHERE operation = ? AND scope_type = ? AND scope_id = ? AND key = ?",
+            (operation, scope_type, scope_id, key),
         ).fetchone()
 
     @staticmethod
     def insert_idempotency(
         conn: sqlite3.Connection,
         key: str,
+        operation: str,
+        scope_type: str,
+        scope_id: str,
         request_hash: str,
         status_code: int,
         response_body: str,
     ) -> None:
         conn.execute(
-            "INSERT INTO idempotency_keys (key, request_hash, status_code, response_body,"
-            " created_at) VALUES (?, ?, ?, ?, ?)",
-            (key, request_hash, status_code, response_body, _now()),
+            "INSERT INTO idempotency_keys (operation, scope_type, scope_id, key,"
+            " request_hash, status_code, response_body, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (operation, scope_type, scope_id, key, request_hash, status_code,
+             response_body, _now()),
+        )
+
+    # ---- 转账聚合（从追加事件读取，不改历史）----
+
+    @staticmethod
+    def get_transfer(
+        conn: sqlite3.Connection, transfer_id: str
+    ) -> TransferRecord | None:
+        """按 transfer_id 聚合出一笔成功的原始转账；不存在返回 None。
+
+        只认 kind='debit' 的原始付款事件，冲正事件（reversal_*）不参与，
+        因此冲正后仍能还原出原始转账。
+        """
+        row = conn.execute(
+            "SELECT transfer_id, account_id AS from_account, delta_cents"
+            " FROM events WHERE transfer_id = ? AND kind = 'debit'",
+            (transfer_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        credit = conn.execute(
+            "SELECT account_id FROM events WHERE transfer_id = ? AND kind = 'credit'",
+            (transfer_id,),
+        ).fetchone()
+        if credit is None:
+            return None
+        return TransferRecord(
+            transfer_id=row["transfer_id"],
+            from_account=row["from_account"],
+            to_account=credit["account_id"],
+            amount_cents=-row["delta_cents"],
+        )
+
+    # ---- 冲正（追加记录）----
+
+    @staticmethod
+    def get_reversal_by_transfer(
+        conn: sqlite3.Connection, transfer_id: str
+    ) -> Reversal | None:
+        row = conn.execute(
+            "SELECT reversal_id, transfer_id, account_id, amount_cents,"
+            " idempotency_key, created_at FROM reversals WHERE transfer_id = ?",
+            (transfer_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Reversal(
+            reversal_id=row["reversal_id"],
+            transfer_id=row["transfer_id"],
+            account_id=row["account_id"],
+            amount_cents=row["amount_cents"],
+            idempotency_key=row["idempotency_key"],
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def list_reversals(conn: sqlite3.Connection) -> list[Reversal]:
+        rows = conn.execute(
+            "SELECT reversal_id, transfer_id, account_id, amount_cents,"
+            " idempotency_key, created_at FROM reversals ORDER BY rowid"
+        ).fetchall()
+        return [
+            Reversal(
+                reversal_id=r["reversal_id"],
+                transfer_id=r["transfer_id"],
+                account_id=r["account_id"],
+                amount_cents=r["amount_cents"],
+                idempotency_key=r["idempotency_key"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    @staticmethod
+    def insert_reversal(
+        conn: sqlite3.Connection,
+        reversal_id: str,
+        transfer_id: str,
+        account_id: str,
+        amount_cents: int,
+        idempotency_key: str,
+    ) -> None:
+        """写入冲正记录。transfer_id 唯一约束在并发下拒绝第二次冲正，
+        驱动 IntegrityError 由事务包装归一化为 StorageError，由 service 层
+        在此之前的同事务复查区分出 TransferAlreadyReversed。
+        """
+        conn.execute(
+            "INSERT INTO reversals (reversal_id, transfer_id, account_id,"
+            " amount_cents, idempotency_key, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (reversal_id, transfer_id, account_id, amount_cents,
+             idempotency_key, _now()),
         )
